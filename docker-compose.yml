@@ -1,0 +1,206 @@
+# =============================================================================
+# OpenClaw docker-compose.yml — Hardened for local llama-server on :8888
+# =============================================================================
+# Directory layout expected on host:
+#   ./                          ← this file lives here
+#   ./Dockerfile                ← the Dockerfile above
+#   ./config/openclaw.json      ← baked in image but also mounted for overrides
+#   ./workspace/                ← agent working directory (only thing agent can write)
+#   ./memory/                   ← persistent agent memory
+#   ./setup-network.sh          ← run ONCE as root before docker compose up
+#
+# Usage:
+#   sudo ./setup-network.sh       # once, creates the bridge + iptables rules
+#   docker compose build          # build the image
+#   docker compose up -d          # start
+#   docker compose logs -f        # watch
+#   sudo ./teardown-network.sh    # when done (removes iptables rules)
+# =============================================================================
+
+name: openclaw
+
+networks:
+  # Isolated bridge — agent can ONLY reach the host's llama-server on :8888.
+  # All other outbound traffic is blocked by iptables rules in setup-network.sh.
+  # Do NOT use the default bridge network.
+  openclaw-isolated:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: "br-openclaw"
+    ipam:
+      config:
+        - subnet: "172.31.200.0/24"
+          gateway: "172.31.200.1"
+    # Prevent inter-container communication (only gateway ↔ cli via loopback).
+    internal: false   # must be false so gateway can reach host; iptables does blocking
+
+volumes:
+  # Named volume for /home/node — prevents node_modules from leaking to host.
+  openclaw-home:
+    driver: local
+
+services:
+
+  # ── Gateway (long-running agent process) ─────────────────────────────────
+  openclaw-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        OPENCLAW_VERSION: "2026.4.25"
+    image: openclaw-hardened:2026.4.25
+
+    container_name: openclaw-gateway
+
+    # ── Security: no root, no privilege escalation ─────────────────────────
+    user: "1000:1001"              # node:openclaw
+    read_only: true                # root filesystem is read-only
+    privileged: false
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./seccomp-openclaw.json   # custom seccomp profile (see below)
+
+    # ── Capabilities: drop everything, add nothing ─────────────────────────
+    cap_drop:
+      - ALL
+    cap_add: []                    # explicitly empty — no capabilities granted
+
+    # ── Writable scratch space (tmpfs, never hits disk) ────────────────────
+    tmpfs:
+      - /tmp/openclaw:size=256m,mode=1770,uid=1000,gid=1001
+      - /run:size=8m,mode=1770,uid=1000,gid=1001
+
+    # ── Volume mounts ──────────────────────────────────────────────────────
+    volumes:
+      # Config: read-only at runtime (written at build time, overridable here)
+      - type: bind
+        source: ./config
+        target: /data/config
+        read_only: false           # openclaw needs to write session tokens here
+      # Workspace: read-write — this is the ONLY place the agent may create files
+      - type: bind
+        source: ./workspace
+        target: /data/workspace
+        read_only: false
+      # Memory: read-write — agent memory persistence
+      - type: bind
+        source: ./memory
+        target: /data/memory
+        read_only: false
+      # Home volume: isolates npm cache, node files from host entirely
+      - type: volume
+        source: openclaw-home
+        target: /home/node
+
+    # ── Network ───────────────────────────────────────────────────────────
+    networks:
+      openclaw-isolated:
+        ipv4_address: "172.31.200.10"
+
+    # Resolve "host.docker.internal" to the Docker bridge gateway IP
+    # so the config's LLAMA_HOST placeholder works after sed substitution.
+    extra_hosts:
+      - "llama-host:172.31.200.1"   # host-side of the bridge = your machine
+
+    # ── Resource limits ────────────────────────────────────────────────────
+    # OpenClaw is JS/Node — it doesn't need much RAM itself.
+    # The heavy work (inference) happens in llama-server on the host.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: "2g"
+        reservations:
+          cpus: "0.5"
+          memory: "512m"
+
+    # ── Environment variables ──────────────────────────────────────────────
+    # No secrets hardcoded here. Put them in a .env file (git-ignored).
+    environment:
+      # Tell OpenClaw where its config lives inside the container
+      OPENCLAW_CONFIG_DIR: "/data/config"
+      OPENCLAW_WORKSPACE_DIR: "/data/workspace"
+      # Disable telemetry and auto-update entirely
+      OPENCLAW_NO_AUTO_UPDATE: "1"
+      OPENCLAW_TELEMETRY: "0"
+      # llama-server endpoint — replaces LLAMA_HOST placeholder in config
+      LLAMA_SERVER_URL: "http://llama-host:8888/v1"
+      # Node production mode
+      NODE_ENV: "production"
+      # Prevent Node from writing to unexpected paths
+      npm_config_cache: "/tmp/openclaw/.npm"
+
+    # ── Startup: patch config with correct host before starting ───────────
+    # Replaces the LLAMA_HOST placeholder baked into the image's openclaw.json
+    # with the actual bridge IP, then starts the gateway.
+    command: >
+      sh -c "
+        sed -i 's|LLAMA_HOST|llama-host|g' /data/config/openclaw.json &&
+        openclaw gateway start --no-open
+      "
+
+    # ── Health check ───────────────────────────────────────────────────────
+    healthcheck:
+      test: ["CMD", "node", "-e",
+             "require('http').get('http://127.0.0.1:18789/healthz',
+             r => process.exit(r.statusCode === 200 ? 0 : 1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    # ── Port binding: loopback only, NOT 0.0.0.0 ──────────────────────────
+    ports:
+      - "127.0.0.1:18789:18789"   # Control UI accessible only from localhost
+
+    restart: unless-stopped
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+  # ── CLI helper (management commands, not long-running) ────────────────────
+  openclaw-cli:
+    image: openclaw-hardened:2026.4.25
+    container_name: openclaw-cli
+    profiles: ["cli"]             # only starts when explicitly requested
+
+    # Share the gateway's network stack for loopback CLI → gateway calls
+    network_mode: "service:openclaw-gateway"
+    depends_on:
+      openclaw-gateway:
+        condition: service_healthy
+
+    user: "1000:1001"
+    read_only: true
+    privileged: false
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    tmpfs:
+      - /tmp:size=64m,mode=1770
+
+    volumes:
+      - type: bind
+        source: ./config
+        target: /data/config
+        read_only: true
+      - type: volume
+        source: openclaw-home
+        target: /home/node
+
+    environment:
+      OPENCLAW_CONFIG_DIR: "/data/config"
+      OPENCLAW_NO_AUTO_UPDATE: "1"
+      NODE_ENV: "production"
+
+    # Override entrypoint for one-shot CLI commands
+    entrypoint: ["/usr/bin/dumb-init", "--", "openclaw"]
+    command: ["--help"]
+
+    restart: "no"
